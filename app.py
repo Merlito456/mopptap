@@ -1,24 +1,32 @@
 import os
 import re
 import time
-import tkinter as tk
-from tkinter import filedialog, messagebox
+from flask import Flask, render_template, request, send_file, redirect, url_for, flash
+from werkzeug.utils import secure_filename
 from docx import Document
 from docx.shared import Inches
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
-from PIL import ImageGrab
 
 
-TEMPLATE_FILE = "Template.docx"
-OUTPUT_DIR = "output"
-TEMP_IMG_DIR = "temp_clipboard_images"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMPLATE_FILE = os.path.join(BASE_DIR, "Template.docx")
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+
+ALLOWED_IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "bmp"}
+ALLOWED_PDF_EXTENSIONS = {"pdf"}
+
+app = Flask(__name__)
+app.secret_key = "mop-secret-key"
 
 
-# -----------------------------
-# General helpers
-# -----------------------------
+def ensure_dirs():
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
 def normalize_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
@@ -28,9 +36,8 @@ def safe_filename(s: str) -> str:
     return s.strip().replace(" ", "_")
 
 
-def ensure_dirs():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    os.makedirs(TEMP_IMG_DIR, exist_ok=True)
+def allowed_file(filename, allowed_exts):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in allowed_exts
 
 
 def iter_all_paragraphs(container):
@@ -55,9 +62,6 @@ def set_paragraph_text(paragraph, text: str):
         paragraph.add_run(text)
 
 
-# -----------------------------
-# Replacement helpers
-# -----------------------------
 def replace_text_in_paragraph(paragraph, replacements):
     full_text = paragraph_full_text(paragraph)
     new_text = full_text
@@ -80,9 +84,6 @@ def replace_everywhere(doc, replacements):
         replace_text_in_container(section.footer, replacements)
 
 
-# -----------------------------
-# Anchor search
-# -----------------------------
 def find_paragraph_by_contains(container, needles, case_insensitive=True):
     for p in iter_all_paragraphs(container):
         txt = paragraph_full_text(p)
@@ -110,9 +111,6 @@ def find_any_anchor(doc, needles):
     return None, None
 
 
-# -----------------------------
-# Insert paragraph/image
-# -----------------------------
 def insert_paragraph_after(paragraph, text="", style=None):
     new_para = paragraph._parent.add_paragraph()
     paragraph._p.addnext(new_para._p)
@@ -141,9 +139,6 @@ def insert_image_after(paragraph, image_path, width=Inches(4.5), caption=None):
     return p_img, None
 
 
-# -----------------------------
-# Hyperlink helper
-# -----------------------------
 def add_hyperlink(paragraph, text, url, color="0000FF", underline=True):
     part = paragraph.part
     r_id = part.relate_to(url, RT.HYPERLINK, is_external=True)
@@ -175,33 +170,6 @@ def add_hyperlink(paragraph, text, url, color="0000FF", underline=True):
     return hyperlink
 
 
-# -----------------------------
-# Clipboard image support
-# -----------------------------
-def save_clipboard_image(slot_name):
-    """
-    Reads image from clipboard and saves it to temp folder.
-    Works best on Windows.
-    """
-    ensure_dirs()
-    img = ImageGrab.grabclipboard()
-
-    if img is None:
-        raise ValueError("No image found in clipboard. Copy an image first, then click Paste.")
-
-    # Sometimes clipboard contains file paths instead of image object
-    if isinstance(img, list):
-        raise ValueError("Clipboard contains file list, not an image. Please copy an actual image.")
-
-    filename = f"{slot_name}_{int(time.time())}.png"
-    path = os.path.join(TEMP_IMG_DIR, filename)
-    img.save(path, "PNG")
-    return path
-
-
-# -----------------------------
-# Business logic
-# -----------------------------
 def build_olt_label(equipment: str, custom_olt_label: str) -> str:
     eq = normalize_spaces(equipment).lower()
     if eq == "nokia lightspan mf-2":
@@ -255,10 +223,8 @@ def insert_power_section_content(doc, data):
         last = img_p
 
     p2 = insert_paragraph_after(last, rs2_line)
-    last = p2
     if data.get("rs2_image"):
-        img_p, _ = insert_image_after(p2, data["rs2_image"], width=Inches(4.5), caption="RS2")
-        last = img_p
+        insert_image_after(p2, data["rs2_image"], width=Inches(4.5), caption="RS2")
 
     return True, f"Inserted RS1/RS2 content under FUSE anchor in {where}."
 
@@ -290,11 +256,42 @@ def insert_existing_rectifier_image(doc, image_path):
     return True, f"Inserted rectifier image under Existing Rectifier in {where}."
 
 
+def save_upload(file_storage, subname):
+    if not file_storage or not file_storage.filename:
+        return ""
+
+    filename = secure_filename(file_storage.filename)
+    timestamp = str(int(time.time() * 1000))
+    final_name = f"{subname}_{timestamp}_{filename}"
+    path = os.path.join(UPLOAD_DIR, final_name)
+    file_storage.save(path)
+    return path
+
+
+def save_base64_image(data_url, subname):
+    if not data_url:
+        return ""
+
+    import base64
+
+    if "," not in data_url:
+        return ""
+
+    header, encoded = data_url.split(",", 1)
+    timestamp = str(int(time.time() * 1000))
+    filename = f"{subname}_{timestamp}.png"
+    path = os.path.join(UPLOAD_DIR, filename)
+
+    with open(path, "wb") as f:
+        f.write(base64.b64decode(encoded))
+
+    return path
+
+
 def generate_mop(data):
     if not os.path.exists(TEMPLATE_FILE):
         raise FileNotFoundError(f"Template file not found: {TEMPLATE_FILE}")
 
-    ensure_dirs()
     doc = Document(TEMPLATE_FILE)
 
     replacements = {
@@ -309,185 +306,76 @@ def generate_mop(data):
 
     replace_everywhere(doc, replacements)
 
-    power_ok, power_msg = insert_power_section_content(doc, data)
-    pdf_ok, pdf_msg = insert_supporting_documents(doc, data.get("tssr_pdf"))
-    rect_ok, rect_msg = insert_existing_rectifier_image(doc, data.get("rectifier_image_page8"))
+    insert_power_section_content(doc, data)
+    insert_supporting_documents(doc, data.get("tssr_pdf"))
+    insert_existing_rectifier_image(doc, data.get("rectifier_image_page8"))
 
     output_file = os.path.join(
         OUTPUT_DIR,
         f"MOP_{safe_filename(data['site_name'])}_{safe_filename(data['plaid'])}.docx"
     )
     doc.save(output_file)
+    return output_file
 
-    return output_file, [power_msg, pdf_msg, rect_msg]
 
+@app.route("/", methods=["GET", "POST"])
+def index():
+    ensure_dirs()
 
-# -----------------------------
-# GUI
-# -----------------------------
-class MopApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("MOP Automation with Clipboard Paste")
-        self.root.geometry("980x700")
-
-        self.entries = {}
-        self.file_paths = {
-            "rs1_image": "",
-            "rs2_image": "",
-            "rectifier_image_page8": "",
-            "tssr_pdf": "",
-        }
-
-        main = tk.Frame(root)
-        main.pack(fill="both", expand=True, padx=10, pady=10)
-
-        fields = [
-            ("Site Name", "site_name"),
-            ("Plaid", "plaid"),
-            ("Equipment", "equipment"),
-            ("Custom OLT Label (if not Nokia Lightspan MF-2)", "olt_label_custom"),
-            ("Prepared By", "prepared_by"),
-            ("Position", "position"),
-            ("Target Date and Time of Implementation", "target_datetime"),
-            ("RS1 Rectifier Name", "rs1_rectifier_name"),
-            ("RS1 Load Assignment", "rs1_load_assignment"),
-            ("RS2 Rectifier Name", "rs2_rectifier_name"),
-            ("RS2 Load Assignment", "rs2_load_assignment"),
-        ]
-
-        row = 0
-        for label_text, key in fields:
-            tk.Label(main, text=label_text, anchor="w").grid(row=row, column=0, sticky="w", padx=5, pady=5)
-            ent = tk.Entry(main, width=75)
-            ent.grid(row=row, column=1, columnspan=3, sticky="we", padx=5, pady=5)
-            self.entries[key] = ent
-            row += 1
-
-        self.entries["equipment"].insert(0, "Nokia Lightspan MF-2")
-        self.entries["position"].insert(0, "OLT Rollout Engineer")
-        self.entries["target_datetime"].insert(0, "May 19- June 19, 2026 10:00AM-6:00PM")
-
-        # RS1
-        tk.Label(main, text="RS1 Image").grid(row=row, column=0, sticky="w", padx=5, pady=5)
-        tk.Button(main, text="Select File", command=lambda: self.select_file("rs1_image", [("Image Files", "*.png;*.jpg;*.jpeg;*.bmp")], self.rs1_label)).grid(row=row, column=1, sticky="w", padx=5)
-        tk.Button(main, text="Paste Clipboard", command=lambda: self.paste_image("rs1_image", self.rs1_label)).grid(row=row, column=2, sticky="w", padx=5)
-        self.rs1_label = tk.Label(main, text="No image selected", anchor="w")
-        self.rs1_label.grid(row=row, column=3, sticky="w", padx=5)
-        row += 1
-
-        # RS2
-        tk.Label(main, text="RS2 Image").grid(row=row, column=0, sticky="w", padx=5, pady=5)
-        tk.Button(main, text="Select File", command=lambda: self.select_file("rs2_image", [("Image Files", "*.png;*.jpg;*.jpeg;*.bmp")], self.rs2_label)).grid(row=row, column=1, sticky="w", padx=5)
-        tk.Button(main, text="Paste Clipboard", command=lambda: self.paste_image("rs2_image", self.rs2_label)).grid(row=row, column=2, sticky="w", padx=5)
-        self.rs2_label = tk.Label(main, text="No image selected", anchor="w")
-        self.rs2_label.grid(row=row, column=3, sticky="w", padx=5)
-        row += 1
-
-        # Rectifier
-        tk.Label(main, text="Page 8 Existing Rectifier Image").grid(row=row, column=0, sticky="w", padx=5, pady=5)
-        tk.Button(main, text="Select File", command=lambda: self.select_file("rectifier_image_page8", [("Image Files", "*.png;*.jpg;*.jpeg;*.bmp")], self.rectifier_label)).grid(row=row, column=1, sticky="w", padx=5)
-        tk.Button(main, text="Paste Clipboard", command=lambda: self.paste_image("rectifier_image_page8", self.rectifier_label)).grid(row=row, column=2, sticky="w", padx=5)
-        self.rectifier_label = tk.Label(main, text="No image selected", anchor="w")
-        self.rectifier_label.grid(row=row, column=3, sticky="w", padx=5)
-        row += 1
-
-        # PDF
-        tk.Label(main, text="TSSR PDF").grid(row=row, column=0, sticky="w", padx=5, pady=5)
-        tk.Button(main, text="Select PDF", command=lambda: self.select_file("tssr_pdf", [("PDF Files", "*.pdf")], self.pdf_label)).grid(row=row, column=1, sticky="w", padx=5)
-        self.pdf_label = tk.Label(main, text="No PDF selected", anchor="w")
-        self.pdf_label.grid(row=row, column=3, sticky="w", padx=5)
-        row += 1
-
-        # Buttons
-        btn_frame = tk.Frame(main)
-        btn_frame.grid(row=row, column=0, columnspan=4, pady=20)
-
-        tk.Button(btn_frame, text="Generate MOP", width=18, command=self.generate).pack(side="left", padx=8)
-        tk.Button(btn_frame, text="Clear", width=12, command=self.clear_form).pack(side="left", padx=8)
-        tk.Button(btn_frame, text="Exit", width=12, command=self.root.quit).pack(side="left", padx=8)
-
-        # Instructions
-        instructions = (
-            "Clipboard paste usage:\n"
-            "1. Copy an image to clipboard (Snipping Tool / screenshot / copied image).\n"
-            "2. Click 'Paste Clipboard' for RS1, RS2, or Rectifier.\n"
-            "3. The image is saved temporarily and used in the generated Word file.\n\n"
-            "Notes:\n"
-            "- No placeholders required.\n"
-            "- Script searches for anchor text like 'FUSE No:', 'Supporting Documents', and 'Existing Rectifier'.\n"
-            "- PDF is inserted as a clickable hyperlink."
-        )
-        tk.Label(main, text=instructions, justify="left", fg="gray25").grid(row=row+1, column=0, columnspan=4, sticky="w", padx=5, pady=10)
-
-        main.columnconfigure(3, weight=1)
-
-    def select_file(self, key, filetypes, label_widget):
-        path = filedialog.askopenfilename(filetypes=filetypes)
-        if path:
-            self.file_paths[key] = path
-            label_widget.config(text=os.path.basename(path))
-
-    def paste_image(self, key, label_widget):
+    if request.method == "POST":
         try:
-            path = save_clipboard_image(key)
-            self.file_paths[key] = path
-            label_widget.config(text=f"[Pasted] {os.path.basename(path)}")
-            messagebox.showinfo("Clipboard Image", f"Image pasted successfully:\n{path}")
+            data = {
+                "site_name": request.form.get("site_name", "").strip(),
+                "plaid": request.form.get("plaid", "").strip(),
+                "equipment": request.form.get("equipment", "").strip(),
+                "olt_label_custom": request.form.get("olt_label_custom", "").strip(),
+                "prepared_by": request.form.get("prepared_by", "").strip(),
+                "position": request.form.get("position", "").strip(),
+                "target_datetime": request.form.get("target_datetime", "").strip(),
+                "rs1_rectifier_name": request.form.get("rs1_rectifier_name", "").strip(),
+                "rs1_load_assignment": request.form.get("rs1_load_assignment", "").strip(),
+                "rs2_rectifier_name": request.form.get("rs2_rectifier_name", "").strip(),
+                "rs2_load_assignment": request.form.get("rs2_load_assignment", "").strip(),
+            }
+
+            required = [
+                "site_name", "plaid", "equipment", "prepared_by", "position",
+                "target_datetime", "rs1_rectifier_name", "rs1_load_assignment",
+                "rs2_rectifier_name", "rs2_load_assignment"
+            ]
+            missing = [f for f in required if not data[f]]
+            if missing:
+                flash("Missing fields: " + ", ".join(missing), "error")
+                return redirect(url_for("index"))
+
+            rs1_image = save_upload(request.files.get("rs1_image"), "rs1_image")
+            rs2_image = save_upload(request.files.get("rs2_image"), "rs2_image")
+            rectifier_image = save_upload(request.files.get("rectifier_image_page8"), "rectifier_image")
+            tssr_pdf = save_upload(request.files.get("tssr_pdf"), "tssr_pdf")
+
+            # clipboard-pasted images from hidden fields
+            if not rs1_image:
+                rs1_image = save_base64_image(request.form.get("rs1_image_paste", ""), "rs1_pasted")
+            if not rs2_image:
+                rs2_image = save_base64_image(request.form.get("rs2_image_paste", ""), "rs2_pasted")
+            if not rectifier_image:
+                rectifier_image = save_base64_image(request.form.get("rectifier_image_paste", ""), "rectifier_pasted")
+
+            data["rs1_image"] = rs1_image
+            data["rs2_image"] = rs2_image
+            data["rectifier_image_page8"] = rectifier_image
+            data["tssr_pdf"] = tssr_pdf
+
+            output_file = generate_mop(data)
+            return send_file(output_file, as_attachment=True)
+
         except Exception as e:
-            messagebox.showerror("Paste Failed", str(e))
+            flash(str(e), "error")
+            return redirect(url_for("index"))
 
-    def clear_form(self):
-        for entry in self.entries.values():
-            entry.delete(0, tk.END)
-
-        self.file_paths = {
-            "rs1_image": "",
-            "rs2_image": "",
-            "rectifier_image_page8": "",
-            "tssr_pdf": "",
-        }
-
-        self.rs1_label.config(text="No image selected")
-        self.rs2_label.config(text="No image selected")
-        self.rectifier_label.config(text="No image selected")
-        self.pdf_label.config(text="No PDF selected")
-
-        self.entries["equipment"].insert(0, "Nokia Lightspan MF-2")
-        self.entries["position"].insert(0, "OLT Rollout Engineer")
-        self.entries["target_datetime"].insert(0, "May 19- June 19, 2026 10:00AM-6:00PM")
-
-    def generate(self):
-        data = {k: e.get().strip() for k, e in self.entries.items()}
-        data.update(self.file_paths)
-
-        required = [
-            "site_name",
-            "plaid",
-            "equipment",
-            "prepared_by",
-            "position",
-            "target_datetime",
-            "rs1_rectifier_name",
-            "rs1_load_assignment",
-            "rs2_rectifier_name",
-            "rs2_load_assignment",
-        ]
-        missing = [field for field in required if not data.get(field)]
-        if missing:
-            messagebox.showerror("Missing Fields", "Please fill in:\n- " + "\n- ".join(missing))
-            return
-
-        try:
-            output_file, notes = generate_mop(data)
-            msg = "MOP generated successfully:\n\n" + output_file + "\n\nNotes:\n- " + "\n- ".join(notes)
-            messagebox.showinfo("Success", msg)
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+    return render_template("index.html")
 
 
 if __name__ == "__main__":
     ensure_dirs()
-    root = tk.Tk()
-    app = MopApp(root)
-    root.mainloop()
+    app.run(debug=True)
